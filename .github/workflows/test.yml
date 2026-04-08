@@ -1,0 +1,64 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: .
+          severity: warning
+
+  docker-build:
+    name: Docker Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t api-key-service .
+
+      - name: Test - no arguments shows usage error
+        run: |
+          output=$(docker run api-key-service 2>&1 || true)
+          echo "$output"
+          echo "$output" | jq -e '.success == false'
+          echo "$output" | jq -e '.error | contains("Usage")'
+
+      - name: Test - invalid JSON shows error
+        run: |
+          output=$(docker run api-key-service 'not json' 2>&1 || true)
+          echo "$output"
+          echo "$output" | jq -e '.success == false'
+          echo "$output" | jq -e '.error | contains("Invalid JSON")'
+
+      - name: Test - missing required field shows error
+        run: |
+          output=$(docker run api-key-service '{"action":"list"}' 2>&1 || true)
+          echo "$output"
+          echo "$output" | jq -e '.success == false'
+          echo "$output" | jq -e '.error | contains("Missing required field")'
+
+      - name: Test - invalid action shows error
+        run: |
+          output=$(docker run api-key-service '{"action":"bogus","db_url":"jdbc:postgresql://x","db_user":"u","db_pass":"p"}' 2>&1 || true)
+          echo "$output"
+          echo "$output" | jq -e '.success == false'
+          echo "$output" | jq -e '.error | contains("Invalid action")'
+
+      - name: Test - valid input reaches JAR (connection refused expected)
+        run: |
+          output=$(docker run api-key-service '{"action":"list","db_url":"jdbc:postgresql://localhost:5432/test","db_user":"test","db_pass":"test"}' 2>&1 || true)
+          echo "$output"
+          # The JAR should load and attempt a DB connection via the PostgreSQL driver
+          echo "$output" | grep -q "org.postgresql"

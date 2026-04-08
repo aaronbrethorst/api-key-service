@@ -102,7 +102,9 @@ ARGS=("$action")
 ARGS+=(-c "$SECURE_TMPDIR/data-sources.xml" -j)
 
 # Execute the JAR with PostgreSQL driver on classpath
-exec java ${JAVA_OPTS:-} \
+# shellcheck disable=SC2206
+JAVA_OPTS_ARRAY=(${JAVA_OPTS:-})
+exec java "${JAVA_OPTS_ARRAY[@]}" \
   -cp "/app/api-key-cli.jar:/app/postgresql.jar" \
   org.onebusaway.cli.apikey.ApiKeyCliMain \
   "${ARGS[@]}"

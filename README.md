@@ -71,16 +71,51 @@ docker run api-key-service '{"action":"delete","db_url":"jdbc:postgresql://host:
 
 ## Render Deployment
 
-This service is deployed as a **worker** on Render (no HTTP endpoint). API key operations are triggered via the [Render one-off job API](https://api-docs.render.com/reference/create-job):
+This service is deployed as a **worker** on Render (no HTTP endpoint). API key operations are triggered via the [Render one-off job API](https://api-docs.render.com/reference/create-job).
+
+### Step 1: Deploy the service
+
+Click **New > Blueprint** in the Render dashboard and connect this repo. The `render.yaml` will configure the worker automatically.
+
+Alternatively, create a **Worker** service manually, set the runtime to **Docker**, and point it at this repo.
+
+### Step 2: Get your PostgreSQL connection details
+
+In the Render dashboard, go to your PostgreSQL database and find the **Connection** section. You'll need three values:
+
+| Render field | JSON field | Example |
+|-------------|------------|---------|
+| Internal Database URL | `db_url` | The hostname portion, e.g. `dpg-abc123` |
+| Username | `db_user` | `myuser` |
+| Password | `db_pass` | `mypass` |
+
+**Convert the Render URL to JDBC format:**
+
+Render gives you: `postgres://myuser:mypass@dpg-abc123.oregon-postgres.render.com:5432/mydb`
+
+Strip the credentials and change the scheme to get the `db_url`:
+- **Internal** (same region, faster, no egress): `jdbc:postgresql://dpg-abc123:5432/mydb`
+- **External** (different region or outside Render): `jdbc:postgresql://dpg-abc123.oregon-postgres.render.com:5432/mydb`
+
+Use the internal hostname when the worker and database are in the same Render region.
+
+### Step 3: Get your Render API key and service ID
+
+1. Create an API key at **Account Settings > API Keys** in the Render dashboard
+2. Find your worker's **Service ID** in the worker's settings page (starts with `srv-`)
+
+### Step 4: Trigger a one-off job
 
 ```bash
-curl -X POST "https://api.render.com/v1/services/YOUR_SERVICE_ID/jobs" \
-  -H "Authorization: Bearer YOUR_RENDER_API_KEY" \
+curl -X POST "https://api.render.com/v1/services/srv-YOUR_SERVICE_ID/jobs" \
+  -H "Authorization: Bearer rnd_YOUR_RENDER_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "startCommand": "/app/entrypoint.sh '\''{ \"action\": \"list\", \"db_url\": \"jdbc:postgresql://host:5432/oba\", \"db_user\": \"admin\", \"db_pass\": \"secret\" }'\''"
+    "startCommand": "/app/entrypoint.sh '\''{ \"action\": \"list\", \"db_url\": \"jdbc:postgresql://dpg-abc123:5432/mydb\", \"db_user\": \"myuser\", \"db_pass\": \"mypass\" }'\''"
   }'
 ```
+
+You can check the job's output in the Render dashboard under your worker's **Logs** tab, or poll the job status via the API.
 
 ## Security
 

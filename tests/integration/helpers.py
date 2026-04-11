@@ -62,3 +62,15 @@ def make_input(action, **kwargs):
     }
     data.update(kwargs)
     return data
+
+
+def assert_success(stdout, stderr, rc, action="service call"):
+    """Assert the service exited 0, with a diagnostic message on failure."""
+    assert rc == 0, f"{action} failed (rc={rc}):\nstdout: {stdout}\nstderr: {stderr}"
+
+
+def run_and_parse(action, **kwargs):
+    """Run the service and parse the JSON output. Asserts rc == 0."""
+    stdout, stderr, rc = run_service(make_input(action, **kwargs))
+    assert_success(stdout, stderr, rc, action)
+    return parse_json_output(stdout)

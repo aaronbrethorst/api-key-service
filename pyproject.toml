@@ -5,3 +5,7 @@ requires-python = ">=3.9"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--ignore=tests/integration"
+markers = [
+    "integration: integration tests requiring Docker and PostgreSQL",
+]

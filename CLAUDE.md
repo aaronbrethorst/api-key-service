@@ -16,16 +16,19 @@ docker build -t api-key-service .
 
 ## Test
 
-Unit tests use pytest (via uv) with mock java/psql binaries — no Docker or database needed:
+Unit tests (mock java/psql, no Docker needed):
 
 ```bash
-uvx pytest tests/ -v
+uvx pytest
 ```
 
-Integration test via Docker (no database — expects a connection error from the JAR):
+Integration tests (real PostgreSQL via docker compose):
 
 ```bash
-docker run api-key-service '{"action":"list","db_url":"jdbc:postgresql://host:5432/db","db_user":"user","db_pass":"pass"}'
+docker compose -f docker-compose.test.yml build
+docker compose -f docker-compose.test.yml up -d --wait postgres
+uvx --with psycopg2-binary --with pytest pytest tests/integration/ -v
+docker compose -f docker-compose.test.yml down -v
 ```
 
 ## JSON input fields

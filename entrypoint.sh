@@ -10,7 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- psql helper functions (defined early so error_exit can use write_result) ---
+# --- psql helper functions (must precede error_exit, which calls write_result) ---
 
 run_psql() {
   PGPASSWORD="${db_pass:-}" psql -h "${pg_host:-}" -p "${pg_port:-}" -U "${db_user:-}" -d "${pg_dbname:-}" -q "$@"
@@ -18,7 +18,7 @@ run_psql() {
 
 ensure_result_table() {
   run_psql <<EOSQL
-    CREATE TABLE IF NOT EXISTS ${result_table} (
+    CREATE TABLE IF NOT EXISTS "${result_table}" (
       id              BIGSERIAL PRIMARY KEY,
       correlation_id  UUID NOT NULL UNIQUE,
       status          VARCHAR(20) NOT NULL DEFAULT 'succeeded',
@@ -34,30 +34,37 @@ write_result() {
   local result_data="$2"
   local error_message="$3"
 
-  # Guard: skip if psql connection params aren't set yet
+  # No-op if result reporting was not requested or connection params are not yet parsed
   if [ -z "${pg_host:-}" ] || [ -z "${result_table:-}" ]; then
     return 0
   fi
 
+  # Use a per-call randomized dollar-quote tag to prevent breakout from data content
+  local dq_tag
+  dq_tag="dq$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
   local rd_sql="NULL"
   if [ -n "$result_data" ]; then
     if echo "$result_data" | jq empty 2>/dev/null; then
-      rd_sql="\$rd\$${result_data}\$rd\$::jsonb"
+      rd_sql="\$${dq_tag}\$${result_data}\$${dq_tag}\$::jsonb"
     else
-      # JAR produced non-JSON output; store as error instead of silently dropping
+      # JAR produced non-JSON output; store as error since result_data is JSONB-typed
       if [ -z "$error_message" ]; then
         error_message="Non-JSON output: $result_data"
       fi
     fi
   fi
 
+  local em_dq_tag
+  em_dq_tag="em$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
   local em_sql="NULL"
   if [ -n "$error_message" ]; then
-    em_sql="\$err\$${error_message}\$err\$"
+    em_sql="\$${em_dq_tag}\$${error_message}\$${em_dq_tag}\$"
   fi
 
   run_psql <<EOSQL
-    INSERT INTO ${result_table} (correlation_id, status, result_data, error_message)
+    INSERT INTO "${result_table}" (correlation_id, status, result_data, error_message)
     VALUES ('${correlation_id}', '${status}', ${rd_sql}, ${em_sql})
     ON CONFLICT (correlation_id) DO UPDATE SET
       status = EXCLUDED.status,
@@ -69,7 +76,7 @@ EOSQL
 error_exit() {
   local msg="$1"
   if [ -n "${correlation_id:-}" ] && [ -n "${result_table:-}" ]; then
-    write_result "failed" "" "$msg" 2>/dev/null || true
+    write_result "failed" "" "$msg" 2>&1 || echo "WARNING: Failed to write error result to database" >&2
   fi
   jq -n --arg msg "$msg" '{"success":false,"error":$msg}'
   exit 1
@@ -114,6 +121,14 @@ if [ -n "$correlation_id" ] && ! echo "$correlation_id" | grep -qE '^[0-9a-f]{8}
   error_exit "Invalid correlation_id: $correlation_id"
 fi
 
+# Require both fields together — providing one without the other is a caller bug
+if [ -n "$correlation_id" ] && [ -z "$result_table" ]; then
+  error_exit "correlation_id provided without result_table"
+fi
+if [ -n "$result_table" ] && [ -z "$correlation_id" ]; then
+  error_exit "result_table provided without correlation_id"
+fi
+
 key=$(echo "$JSON_INPUT" | jq -r '.key // ""')
 name=$(echo "$JSON_INPUT" | jq -r '.name // ""')
 email=$(echo "$JSON_INPUT" | jq -r '.email // ""')
@@ -124,9 +139,22 @@ minApiReqInt=$(echo "$JSON_INPUT" | jq -r '.minApiReqInt // ""')
 # --- Parse JDBC URL for psql connection ---
 
 if [ -n "$correlation_id" ] && [ -n "$result_table" ]; then
-  pg_host=$(echo "$db_url" | sed -E 's|jdbc:postgresql://([^:]+):.*|\1|')
-  pg_port=$(echo "$db_url" | sed -E 's|jdbc:postgresql://[^:]+:([0-9]+)/.*|\1|')
-  pg_dbname=$(echo "$db_url" | sed -E 's|jdbc:postgresql://[^/]+/(.+)|\1|')
+  if echo "$db_url" | grep -qE 'jdbc:postgresql://[^:/]+/'; then
+    # No port specified — use default
+    pg_host=$(echo "$db_url" | sed -E 's|jdbc:postgresql://([^/]+)/.*|\1|')
+    pg_port="5432"
+  else
+    pg_host=$(echo "$db_url" | sed -E 's|jdbc:postgresql://([^:]+):.*|\1|')
+    pg_port=$(echo "$db_url" | sed -E 's|jdbc:postgresql://[^:]+:([0-9]+)/.*|\1|')
+  fi
+  pg_dbname=$(echo "$db_url" | sed -E 's|jdbc:postgresql://[^/]+/([^?]+).*|\1|')
+
+  if [ -z "$pg_host" ] || [ -z "$pg_port" ] || [ -z "$pg_dbname" ]; then
+    error_exit "Failed to parse JDBC URL for psql connection: $db_url"
+  fi
+  if ! echo "$pg_port" | grep -qE '^[0-9]+$'; then
+    error_exit "Failed to extract valid port from JDBC URL: $db_url"
+  fi
 fi
 
 # --- Build data-sources.xml ---
@@ -178,6 +206,7 @@ ARGS=("$action")
 ARGS+=(-c "$SECURE_TMPDIR/data-sources.xml" -j)
 
 # --- Run JAR and capture output ---
+# Do not use exec — the EXIT trap must fire to clean up data-sources.xml
 
 # shellcheck disable=SC2206
 JAVA_OPTS_ARRAY=(${JAVA_OPTS:-})
@@ -192,21 +221,28 @@ jar_stderr=$(cat "$jar_stderr_file")
 rm -f "$jar_stderr_file"
 
 # --- Write result to table if correlation_id is set ---
+# Reporting failures must not kill the script after the JAR has already run
 
 if [ -n "$correlation_id" ] && [ -n "$result_table" ]; then
-  ensure_result_table
-
-  # Clean up orphaned rows older than 24 hours
-  run_psql -c "DELETE FROM ${result_table} WHERE created_at < NOW() - INTERVAL '24 hours';" 2>/dev/null || true
-
-  if [ "$jar_exit_code" -eq 0 ]; then
-    write_result "succeeded" "$jar_output" ""
+  if ! ensure_result_table; then
+    echo "ERROR: Failed to create/verify result table '${result_table}'. Result will not be written." >&2
   else
-    write_result "failed" "" "JAR exited with code $jar_exit_code: $jar_stderr"
+    # Purge result rows older than 24 hours to prevent unbounded table growth
+    run_psql -c "DELETE FROM \"${result_table}\" WHERE created_at < NOW() - INTERVAL '24 hours';" 2>&1 || echo "WARNING: Orphan row cleanup failed" >&2
+
+    if [ "$jar_exit_code" -eq 0 ]; then
+      if ! write_result "succeeded" "$jar_output" ""; then
+        echo "ERROR: Failed to write result to ${result_table} for correlation_id=${correlation_id}" >&2
+      fi
+    else
+      if ! write_result "failed" "" "JAR exited with code $jar_exit_code: $jar_stderr"; then
+        echo "ERROR: Failed to write result to ${result_table} for correlation_id=${correlation_id}" >&2
+      fi
+    fi
   fi
 fi
 
-# Always print to stdout/stderr for Render dashboard visibility
+# Always echo to stdout/stderr for Render dashboard visibility (duplicates DB result intentionally)
 echo "$jar_output"
 if [ -n "$jar_stderr" ]; then
   echo "$jar_stderr" >&2

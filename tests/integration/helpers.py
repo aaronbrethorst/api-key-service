@@ -15,7 +15,7 @@ DB_PASS = "testpass"
 DB_NAME = "oba_test"
 
 # JDBC URL as seen from inside the compose network
-JDBC_URL = "jdbc:postgresql://postgres:5432/oba_test"
+JDBC_URL = "jdbc:postgresql://postgres:5432/oba_test?sslmode=disable"
 
 
 def run_service(input_dict):

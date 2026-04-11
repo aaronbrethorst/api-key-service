@@ -13,7 +13,7 @@ trap cleanup EXIT
 # --- psql helper functions (must precede error_exit, which calls write_result) ---
 
 run_psql() {
-  PGPASSWORD="${db_pass:-}" psql -h "${pg_host:-}" -p "${pg_port:-}" -U "${db_user:-}" -d "${pg_dbname:-}" -q "$@"
+  PGPASSWORD="${db_pass:-}" PGSSLMODE="${pg_sslmode:-require}" psql -h "${pg_host:-}" -p "${pg_port:-}" -U "${db_user:-}" -d "${pg_dbname:-}" -q "$@"
 }
 
 ensure_result_table() {
@@ -148,6 +148,7 @@ if [ -n "$correlation_id" ] && [ -n "$result_table" ]; then
     pg_port=$(echo "$db_url" | sed -E 's|jdbc:postgresql://[^:]+:([0-9]+)/.*|\1|')
   fi
   pg_dbname=$(echo "$db_url" | sed -E 's|jdbc:postgresql://[^/]+/([^?]+).*|\1|')
+  pg_sslmode=$(echo "$db_url" | sed -nE 's|.*[?&]sslmode=([^&]+).*|\1|p')
 
   if [ -z "$pg_host" ] || [ -z "$pg_port" ] || [ -z "$pg_dbname" ]; then
     error_exit "Failed to parse JDBC URL for psql connection: $db_url"

@@ -20,6 +20,17 @@ jobs:
           scandir: .
           severity: warning
 
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Run tests
+        run: uvx pytest tests/ -v
+
   docker-build:
     name: Docker Build & Test
     runs-on: ubuntu-latest

@@ -14,7 +14,15 @@ Docker wrapper for the OneBusAway API Key CLI JAR, designed to run as Render one
 docker build -t api-key-service .
 ```
 
-## Test locally
+## Test
+
+Unit tests use pytest (via uv) with mock java/psql binaries — no Docker or database needed:
+
+```bash
+uvx pytest tests/ -v
+```
+
+Integration test via Docker (no database — expects a connection error from the JAR):
 
 ```bash
 docker run api-key-service '{"action":"list","db_url":"jdbc:postgresql://host:5432/db","db_user":"user","db_pass":"pass"}'

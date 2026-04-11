@@ -213,7 +213,7 @@ JAVA_OPTS_ARRAY=(${JAVA_OPTS:-})
 
 jar_stderr_file=$(mktemp)
 jar_exit_code=0
-jar_output=$(java "${JAVA_OPTS_ARRAY[@]}" \
+jar_output=$(java ${JAVA_OPTS_ARRAY[@]+"${JAVA_OPTS_ARRAY[@]}"} \
   -cp "/app/api-key-cli.jar:/app/postgresql.jar" \
   org.onebusaway.cli.apikey.ApiKeyCliMain \
   "${ARGS[@]}" 2>"$jar_stderr_file") || jar_exit_code=$?

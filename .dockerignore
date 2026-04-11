@@ -5,3 +5,4 @@ tests/
 pyproject.toml
 requirements-test.txt
 .pytest_cache
+docker-compose.test.yml

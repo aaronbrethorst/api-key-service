@@ -12,18 +12,29 @@ def _make_mocks(bin_dir, psql_log_path):
     java.write_text("#!/usr/bin/env bash\nprintf '%s' '[]'\n")
     java.chmod(java.stat().st_mode | stat.S_IEXEC)
 
-    # Mock psql that logs the -h, -p, -U, -d flag values
+    # Mock psql that parses the connection URI to extract connection params
     psql = bin_dir / "psql"
     psql.write_text(
         "#!/usr/bin/env bash\n"
-        "# Parse flags to extract connection params\n"
-        "while [[ $# -gt 0 ]]; do\n"
-        "  case $1 in\n"
-        f"    -h) echo \"HOST=$2\" >> '{psql_log_path}'; shift 2 ;;\n"
-        f"    -p) echo \"PORT=$2\" >> '{psql_log_path}'; shift 2 ;;\n"
-        f"    -U) echo \"USER=$2\" >> '{psql_log_path}'; shift 2 ;;\n"
-        f"    -d) echo \"DB=$2\" >> '{psql_log_path}'; shift 2 ;;\n"
-        "    *) shift ;;\n"
+        "# Extract connection params from postgresql:// URI (first non-flag arg)\n"
+        "for arg in \"$@\"; do\n"
+        "  case $arg in\n"
+        "    postgresql://*)\n"
+        "      uri=\"$arg\"\n"
+        "      # Strip scheme\n"
+        "      rest=\"${uri#postgresql://}\"\n"
+        "      # user:pass@host:port/db?params\n"
+        "      userpass=\"${rest%%@*}\"\n"
+        "      hostpart=\"${rest#*@}\"\n"
+        "      hostport=\"${hostpart%%/*}\"\n"
+        "      dbparams=\"${hostpart#*/}\"\n"
+        "      db=\"${dbparams%%\\?*}\"\n"
+        "      host=\"${hostport%%:*}\"\n"
+        "      port=\"${hostport#*:}\"\n"
+        f"      echo \"HOST=$host\" >> '{psql_log_path}'\n"
+        f"      echo \"PORT=$port\" >> '{psql_log_path}'\n"
+        f"      echo \"DB=$db\" >> '{psql_log_path}'\n"
+        "      ;;\n"
         "  esac\n"
         "done\n"
         "cat > /dev/null\n"

@@ -6,7 +6,8 @@ ARG PG_DRIVER_VERSION=42.7.5
 RUN apt-get update && \
     apt-get install -y \
     jq \
-    curl && \
+    curl \
+    postgresql-client && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -232,7 +232,13 @@ if [ -n "$correlation_id" ] && [ -n "$result_table" ]; then
     run_psql -c "DELETE FROM \"${result_table}\" WHERE created_at < NOW() - INTERVAL '24 hours';" 2>&1 || echo "WARNING: Orphan row cleanup failed" >&2
 
     if [ "$jar_exit_code" -eq 0 ]; then
-      if ! write_result "succeeded" "$jar_output" ""; then
+      # The JAR may print non-JSON warning lines to stdout before the JSON payload.
+      # Extract just the JSON object/array for storage.
+      jar_json=$(echo "$jar_output" | sed -n '/^[[:space:]]*[{\[]/,$p')
+      if [ -z "$jar_json" ]; then
+        jar_json="$jar_output"
+      fi
+      if ! write_result "succeeded" "$jar_json" ""; then
         echo "ERROR: Failed to write result to ${result_table} for correlation_id=${correlation_id}" >&2
       fi
     else

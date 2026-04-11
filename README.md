@@ -69,6 +69,23 @@ docker run api-key-service '{"action":"update","db_url":"jdbc:postgresql://host:
 docker run api-key-service '{"action":"delete","db_url":"jdbc:postgresql://host:5432/oba","db_user":"admin","db_pass":"secret","key":"my-api-key"}'
 ```
 
+## Testing
+
+**Unit tests** mock `java` and `psql`, so no Docker or database is required:
+
+```bash
+uvx pytest
+```
+
+**Integration tests** run the service container against a real PostgreSQL via Docker Compose:
+
+```bash
+docker compose -f docker-compose.test.yml build
+docker compose -f docker-compose.test.yml up -d --wait postgres
+uvx --with psycopg2-binary --with pytest pytest tests/integration/ -v
+docker compose -f docker-compose.test.yml down -v
+```
+
 ## Render Deployment
 
 This service is deployed as a **worker** on Render (no HTTP endpoint). API key operations are triggered via the [Render one-off job API](https://api-docs.render.com/reference/create-job).

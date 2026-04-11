@@ -13,7 +13,7 @@ trap cleanup EXIT
 # --- psql helper functions (must precede error_exit, which calls write_result) ---
 
 run_psql() {
-  PGPASSWORD="${db_pass:-}" PGSSLMODE="${pg_sslmode:-require}" psql -h "${pg_host:-}" -p "${pg_port:-}" -U "${db_user:-}" -d "${pg_dbname:-}" -q "$@"
+  psql "postgresql://${db_user:-}:${db_pass:-}@${pg_host:-}:${pg_port:-}/${pg_dbname:-}?sslmode=${pg_sslmode:-require}" -q "$@"
 }
 
 ensure_result_table() {

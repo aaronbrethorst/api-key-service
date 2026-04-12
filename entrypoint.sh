@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""Entrypoint for the OneBusAway API Key service container.
-
-Accepts a JSON blob (raw or base64-encoded) describing a single action against
-the api-key-cli JAR, or a bulk_create action that iterates a CSV file.
-
-Named `entrypoint.sh` rather than `entrypoint.py` so the Dockerfile ENTRYPOINT
-and Render startCommand keep working without change. The shebang drives it.
-"""
+"""Filename is .sh (not .py) because the Dockerfile ENTRYPOINT and Render
+startCommand depend on it; the shebang drives execution."""
 
 from __future__ import annotations
 
@@ -24,11 +18,13 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 from xml.sax.saxutils import quoteattr
 
-CSV_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+CSV_MAX_BYTES = 10 * 1024 * 1024
 CSV_TIMEOUT_SECS = 60
+DEFAULT_ROW_JAR_TIMEOUT_SECS = 300
 
 VALID_ACTIONS = {"create", "list", "get", "update", "delete", "bulk_create"}
 REQUIRED_FIELDS = ("action", "db_url", "db_user", "db_pass")
@@ -44,8 +40,6 @@ class ValidationError(Exception):
     pass
 
 
-# --- input parsing ---------------------------------------------------------
-
 def _is_json_object(text: str) -> Optional[dict]:
     try:
         parsed = json.loads(text)
@@ -53,13 +47,15 @@ def _is_json_object(text: str) -> Optional[dict]:
         return None
     return parsed if isinstance(parsed, dict) else None
 
+
 def parse_input(raw: str) -> dict:
     obj = _is_json_object(raw)
     if obj is not None:
         return obj
+    cleaned = "".join(raw.split())
     try:
-        decoded = base64.b64decode(raw, validate=True).decode("utf-8")
-    except Exception:
+        decoded = base64.b64decode(cleaned, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
         raise ValidationError(
             "Invalid JSON input: not a JSON object and not valid base64-encoded JSON"
         )
@@ -72,9 +68,9 @@ def parse_input(raw: str) -> dict:
 
 
 def validate(payload: dict) -> dict:
-    for field in REQUIRED_FIELDS:
-        if not payload.get(field):
-            raise ValidationError(f"Missing required field: {field}")
+    for fname in REQUIRED_FIELDS:
+        if not payload.get(fname):
+            raise ValidationError(f"Missing required field: {fname}")
 
     action = payload["action"]
     if action not in VALID_ACTIONS:
@@ -101,9 +97,15 @@ def validate(payload: dict) -> dict:
     return payload
 
 
-# --- JDBC parsing ----------------------------------------------------------
+@dataclass(frozen=True)
+class PgConnInfo:
+    host: str
+    port: str
+    dbname: str
+    sslmode: str
 
-def parse_jdbc_url(db_url: str) -> dict:
+
+def parse_jdbc_url(db_url: str) -> PgConnInfo:
     if not db_url.startswith("jdbc:postgresql://"):
         raise ValidationError(f"Failed to parse JDBC URL for psql connection: {db_url}")
     parsed = urllib.parse.urlparse(db_url[len("jdbc:"):])
@@ -116,10 +118,8 @@ def parse_jdbc_url(db_url: str) -> dict:
     except ValueError:
         raise ValidationError(f"Failed to extract valid port from JDBC URL: {db_url}")
     sslmode = urllib.parse.parse_qs(parsed.query).get("sslmode", ["require"])[0]
-    return {"host": host, "port": port, "dbname": dbname, "sslmode": sslmode}
+    return PgConnInfo(host=host, port=port, dbname=dbname, sslmode=sslmode)
 
-
-# --- data-sources.xml ------------------------------------------------------
 
 DATA_SOURCES_XML_TMPL = """<?xml version="1.0" encoding="UTF-8"?>
 <beans xmlns="http://www.springframework.org/schema/beans"
@@ -135,6 +135,7 @@ DATA_SOURCES_XML_TMPL = """<?xml version="1.0" encoding="UTF-8"?>
 </beans>
 """
 
+
 def write_data_sources_xml(tmpdir: str, db_url: str, db_user: str, db_pass: str) -> str:
     path = os.path.join(tmpdir, "data-sources.xml")
     body = DATA_SOURCES_XML_TMPL.format(
@@ -148,25 +149,25 @@ def write_data_sources_xml(tmpdir: str, db_url: str, db_user: str, db_pass: str)
     return path
 
 
-# --- psql client -----------------------------------------------------------
-
+@dataclass(frozen=True)
 class PgClient:
-    """Shells out to psql so the existing test suite (which mocks psql as a
-    binary on PATH) keeps working. All SQL that interpolates user-controlled
-    data is dollar-quoted with a random tag to prevent body breakout."""
+    """All user-controlled SQL is dollar-quoted with a random tag to prevent
+    body breakout."""
 
-    def __init__(self, host, port, dbname, sslmode, user, password):
-        self.host = host
-        self.port = port
-        self.dbname = dbname
-        self.sslmode = sslmode
-        self.user = user
-        self.password = password
+    host: str
+    port: str
+    dbname: str
+    sslmode: str
+    user: str
+    password: str
 
     @classmethod
     def from_jdbc(cls, db_url: str, user: str, password: str) -> "PgClient":
-        pg = parse_jdbc_url(db_url)
-        return cls(pg["host"], pg["port"], pg["dbname"], pg["sslmode"], user, password)
+        info = parse_jdbc_url(db_url)
+        return cls(
+            host=info.host, port=info.port, dbname=info.dbname, sslmode=info.sslmode,
+            user=user, password=password,
+        )
 
     @property
     def _conn_str(self) -> str:
@@ -181,7 +182,7 @@ class PgClient:
             input=stdin, text=True, capture_output=True, check=False,
         )
 
-    def ensure_result_table(self, result_table: str) -> bool:
+    def ensure_result_table(self, result_table: str) -> tuple:
         ddl = f"""    CREATE TABLE IF NOT EXISTS "{result_table}" (
       id              BIGSERIAL PRIMARY KEY,
       correlation_id  UUID NOT NULL UNIQUE,
@@ -191,16 +192,18 @@ class PgClient:
       created_at      TIMESTAMP NOT NULL DEFAULT NOW()
     );
 """
-        return self._run(stdin=ddl).returncode == 0
+        r = self._run(stdin=ddl)
+        return (r.returncode == 0, r.stderr)
 
-    def purge_old_rows(self, result_table: str) -> None:
-        self._run(
+    def purge_old_rows(self, result_table: str) -> tuple:
+        r = self._run(
             "-c",
             f'DELETE FROM "{result_table}" WHERE created_at < NOW() - INTERVAL \'24 hours\';',
         )
+        return (r.returncode == 0, r.stderr)
 
     def write_result(self, result_table: str, correlation_id: str,
-                     status: str, result_data: str, error_message: str) -> bool:
+                     status: str, result_data: str, error_message: str) -> tuple:
         rd_sql = "NULL"
         em = error_message
         if result_data:
@@ -220,7 +223,8 @@ class PgClient:
             f"      result_data = EXCLUDED.result_data,\n"
             f"      error_message = EXCLUDED.error_message;\n"
         )
-        return self._run(stdin=sql).returncode == 0
+        r = self._run(stdin=sql)
+        return (r.returncode == 0, r.stderr)
 
 
 def _dollar_quote(body: str, prefix: str) -> str:
@@ -228,33 +232,33 @@ def _dollar_quote(body: str, prefix: str) -> str:
     return f"${tag}${body}${tag}$"
 
 
-# --- JAR invocation --------------------------------------------------------
-
 def _java_opts() -> list:
     return shlex.split(os.environ.get("JAVA_OPTS", ""))
 
-def run_jar(args: list) -> subprocess.CompletedProcess:
+
+def run_jar(args: list, timeout: Optional[float] = None) -> subprocess.CompletedProcess:
     cmd = [
         "java", *_java_opts(),
         "-cp", f"{JAR_PATH}:{PG_DRIVER_PATH}",
         MAIN_CLASS,
         *args,
     ]
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
 
 
 def download_csv(url: str, dest_path: str) -> None:
-    """Download CSV at `url` to `dest_path` with a hard size cap and timeout.
-
-    Never includes `url` in raised error messages — signed URLs may carry
-    credentials.
-    """
+    """Never includes `url` in raised error messages — signed URLs may carry
+    credentials."""
     req = urllib.request.Request(url, headers={"User-Agent": "api-key-service"})
     try:
         resp = urllib.request.urlopen(req, timeout=CSV_TIMEOUT_SECS)
     except urllib.error.HTTPError as e:
+        print(f"CSV download failed: HTTPError {e.code}", file=sys.stderr)
         raise ValidationError(f"Failed to download CSV: HTTP {e.code}")
-    except (urllib.error.URLError, socket.timeout, OSError):
+    except (urllib.error.URLError, socket.timeout, OSError) as e:
+        # Log the exception class + message to stderr (not the URL) so
+        # operators can distinguish DNS, TLS, connection-refused, etc.
+        print(f"CSV download failed: {type(e).__name__}: {e}", file=sys.stderr)
         raise ValidationError("Failed to download CSV")
 
     with resp:
@@ -296,37 +300,81 @@ BULK_ROW_FIELDS = (
 def build_args(action: str, source: dict, fields, ds_xml_path: str,
                initial: tuple = ()) -> list:
     args = [action, *initial]
-    for field, flag in fields:
-        val = (source.get(field) or "").strip()
+    for fname, flag in fields:
+        val = (source.get(fname) or "").strip()
         if val:
             args += [flag, val]
     args += ["-c", ds_xml_path, "-j"]
     return args
 
 
-def run_bulk_create(csv_path: str, ds_xml_path: str) -> dict:
-    total = succeeded = failed = 0
-    errors: list = []
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-        for row_num, row in enumerate(csv.DictReader(f), start=1):
-            total += 1
-            api_key = (row.get("api_key") or "").strip()
-            if not api_key:
-                failed += 1
-                errors.append({"row": row_num, "error": "missing api_key"})
-                continue
-            args = build_args("create", row, BULK_ROW_FIELDS, ds_xml_path,
-                              initial=("-k", api_key))
-            proc = run_jar(args)
-            if proc.returncode == 0:
-                succeeded += 1
-            else:
-                failed += 1
-                err_text = (proc.stderr or "").strip()[:500] or (
-                    f"JAR exited with code {proc.returncode}"
-                )
-                errors.append({"row": row_num, "key": api_key, "error": err_text})
-    return {"total": total, "succeeded": succeeded, "failed": failed, "errors": errors}
+@dataclass
+class BulkSummary:
+    total: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    errors: list = field(default_factory=list)
+
+
+def _row_error(proc: subprocess.CompletedProcess) -> str:
+    stderr = (proc.stderr or "").strip()
+    if stderr:
+        return stderr[:500]
+    stdout = (proc.stdout or "").strip()
+    if stdout:
+        return f"JAR exited with code {proc.returncode}. stdout tail: {stdout[-500:]}"
+    return f"JAR exited with code {proc.returncode}"
+
+
+def run_bulk_create(csv_path: str, ds_xml_path: str,
+                    row_timeout_secs: float) -> BulkSummary:
+    summary = BulkSummary()
+    try:
+        fh = open(csv_path, "r", encoding="utf-8-sig", newline="")
+    except (UnicodeDecodeError, OSError) as e:
+        raise ValidationError(f"Failed to read CSV: {type(e).__name__}")
+    with fh as f:
+        try:
+            reader = csv.DictReader(f)
+            rows = enumerate(reader, start=1)
+            while True:
+                try:
+                    row_num, row = next(rows)
+                except StopIteration:
+                    break
+                except (csv.Error, UnicodeDecodeError) as e:
+                    raise ValidationError(f"Malformed CSV: {type(e).__name__}: {e}")
+
+                summary.total += 1
+                api_key = (row.get("api_key") or "").strip()
+                if not api_key:
+                    summary.failed += 1
+                    summary.errors.append({"row": row_num, "error": "missing api_key"})
+                    continue
+                args = build_args("create", row, BULK_ROW_FIELDS, ds_xml_path,
+                                  initial=("-k", api_key))
+                try:
+                    proc = run_jar(args, timeout=row_timeout_secs)
+                except subprocess.TimeoutExpired:
+                    summary.failed += 1
+                    summary.errors.append({
+                        "row": row_num,
+                        "key": api_key,
+                        "error": f"JAR timeout after {row_timeout_secs}s",
+                    })
+                    continue
+                if proc.returncode == 0:
+                    summary.succeeded += 1
+                else:
+                    summary.failed += 1
+                    summary.errors.append({
+                        "row": row_num,
+                        "key": api_key,
+                        "error": _row_error(proc),
+                    })
+        except ValidationError:
+            raise
+    return summary
 
 
 def _emit_error_json(msg: str) -> None:
@@ -334,6 +382,7 @@ def _emit_error_json(msg: str) -> None:
 
 
 _JSON_LINE_START = re.compile(r"^\s*[\[{]")
+
 
 def extract_jar_json(output: str) -> str:
     lines = output.splitlines(keepends=True)
@@ -347,18 +396,26 @@ def _record_result(pg: Optional[PgClient], result_table: str, correlation_id: st
                    status: str, result_data: str, error_message: str) -> None:
     if pg is None or not result_table or not correlation_id:
         return
-    if not pg.ensure_result_table(result_table):
+    ok, stderr = pg.ensure_result_table(result_table)
+    if not ok:
         print(
-            f"ERROR: Failed to create/verify result table '{result_table}'. "
-            "Result will not be written.",
+            f"ERROR: Failed to create/verify result table '{result_table}': {stderr.strip()}",
             file=sys.stderr,
         )
         return
-    pg.purge_old_rows(result_table)
-    if not pg.write_result(result_table, correlation_id, status, result_data, error_message):
+    purge_ok, purge_stderr = pg.purge_old_rows(result_table)
+    if not purge_ok:
+        print(
+            f"WARNING: Orphan row cleanup failed for '{result_table}': {purge_stderr.strip()}",
+            file=sys.stderr,
+        )
+    write_ok, write_stderr = pg.write_result(
+        result_table, correlation_id, status, result_data, error_message,
+    )
+    if not write_ok:
         print(
             f"ERROR: Failed to write result to {result_table} "
-            f"for correlation_id={correlation_id}",
+            f"for correlation_id={correlation_id}: {write_stderr.strip()}",
             file=sys.stderr,
         )
 
@@ -374,16 +431,29 @@ def main(argv: list) -> int:
     result_table = ""
     try:
         payload = parse_input(argv[1])
+
+        # Best-effort PgClient construction up front so that a ValidationError
+        # raised by validate() can still be recorded against the caller's
+        # correlation_id. Silently leaves pg=None if the payload is too
+        # malformed to build a client.
+        correlation_id = (payload.get("correlation_id") or "") if isinstance(payload, dict) else ""
+        result_table = (payload.get("result_table") or "") if isinstance(payload, dict) else ""
+        if (correlation_id and result_table
+                and UUID_RE.match(correlation_id)
+                and TABLE_NAME_RE.match(result_table)
+                and payload.get("db_url") and payload.get("db_user") and payload.get("db_pass")):
+            try:
+                pg = PgClient.from_jdbc(
+                    payload["db_url"], payload["db_user"], payload["db_pass"],
+                )
+            except ValidationError:
+                pg = None
+
         validate(payload)
 
-        correlation_id = payload.get("correlation_id") or ""
-        result_table = payload.get("result_table") or ""
         db_url = payload["db_url"]
         db_user = payload["db_user"]
         db_pass = payload["db_pass"]
-
-        if correlation_id and result_table:
-            pg = PgClient.from_jdbc(db_url, db_user, db_pass)
 
         tmpdir = tempfile.mkdtemp()
         os.chmod(tmpdir, 0o700)
@@ -392,10 +462,17 @@ def main(argv: list) -> int:
         if payload["action"] == "bulk_create":
             csv_path = os.path.join(tmpdir, "import.csv")
             download_csv(payload["csv_url"], csv_path)
-            summary = run_bulk_create(csv_path, ds_xml)
-            jar_output = json.dumps(summary) + "\n"
+            row_timeout = float(payload.get("jar_timeout_secs") or DEFAULT_ROW_JAR_TIMEOUT_SECS)
+            summary = run_bulk_create(csv_path, ds_xml, row_timeout)
+            jar_output = json.dumps(asdict(summary)) + "\n"
             jar_stderr = ""
-            jar_exit_code = 0
+            # Non-zero exit when total work with zero successes is a failure.
+            # A partial failure (any success) stays exit 0 so callers don't
+            # retry the successful rows.
+            if summary.total > 0 and summary.succeeded == 0:
+                jar_exit_code = 2
+            else:
+                jar_exit_code = 0
         else:
             args = build_args(payload["action"], payload, SINGLE_ACTION_FIELDS, ds_xml)
             proc = run_jar(args)
@@ -403,16 +480,14 @@ def main(argv: list) -> int:
             jar_stderr = proc.stderr
             jar_exit_code = proc.returncode
 
+        status = "succeeded" if jar_exit_code == 0 else "failed"
         if jar_exit_code == 0:
-            _record_result(
-                pg, result_table, correlation_id,
-                "succeeded", extract_jar_json(jar_output), "",
-            )
+            _record_result(pg, result_table, correlation_id,
+                           status, extract_jar_json(jar_output), "")
         else:
-            _record_result(
-                pg, result_table, correlation_id,
-                "failed", "", f"JAR exited with code {jar_exit_code}: {jar_stderr}",
-            )
+            _record_result(pg, result_table, correlation_id,
+                           status, extract_jar_json(jar_output),
+                           f"JAR exited with code {jar_exit_code}: {jar_stderr}")
 
         if jar_output:
             sys.stdout.write(jar_output)
@@ -426,16 +501,18 @@ def main(argv: list) -> int:
 
     except ValidationError as e:
         msg = str(e)
-        if pg is not None:
-            try:
-                pg.write_result(result_table, correlation_id, "failed", "", msg)
-            except Exception:
-                print("WARNING: Failed to write error result to database", file=sys.stderr)
+        _record_result(pg, result_table, correlation_id, "failed", "", msg)
         _emit_error_json(msg)
         return 1
     finally:
         if tmpdir:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            try:
+                shutil.rmtree(tmpdir)
+            except OSError as e:
+                print(
+                    f"WARNING: Failed to remove tempdir containing data-sources.xml: {e}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":

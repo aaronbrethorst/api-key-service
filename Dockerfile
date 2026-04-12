@@ -7,7 +7,8 @@ RUN apt-get update && \
     apt-get install -y \
     jq \
     curl \
-    postgresql-client && \
+    postgresql-client \
+    python3 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

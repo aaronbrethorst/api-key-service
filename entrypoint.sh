@@ -1,24 +1,188 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""Entrypoint for the OneBusAway API Key service container.
 
-SECURE_TMPDIR=""
+Accepts a JSON blob (raw or base64-encoded) describing a single action against
+the api-key-cli JAR, or a bulk_create action that iterates a CSV file.
 
-cleanup() {
-  if [ -n "$SECURE_TMPDIR" ]; then
-    rm -rf "$SECURE_TMPDIR"
-  fi
-}
-trap cleanup EXIT
+Named `entrypoint.sh` rather than `entrypoint.py` so the Dockerfile ENTRYPOINT
+and Render startCommand keep working without change. The shebang drives it.
+"""
 
-# --- psql helper functions (must precede error_exit, which calls write_result) ---
+from __future__ import annotations
 
-run_psql() {
-  psql "postgresql://${db_user:-}:${db_pass:-}@${pg_host:-}:${pg_port:-}/${pg_dbname:-}?sslmode=${pg_sslmode:-require}" -q "$@"
-}
+import base64
+import csv
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Optional
+from xml.sax.saxutils import quoteattr
 
-ensure_result_table() {
-  run_psql <<EOSQL
-    CREATE TABLE IF NOT EXISTS "${result_table}" (
+CSV_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+CSV_TIMEOUT_SECS = 60
+
+VALID_ACTIONS = {"create", "list", "get", "update", "delete", "bulk_create"}
+REQUIRED_FIELDS = ("action", "db_url", "db_user", "db_pass")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+TABLE_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+JAR_PATH = "/app/api-key-cli.jar"
+PG_DRIVER_PATH = "/app/postgresql.jar"
+MAIN_CLASS = "org.onebusaway.cli.apikey.ApiKeyCliMain"
+
+
+class ValidationError(Exception):
+    pass
+
+
+# --- input parsing ---------------------------------------------------------
+
+def _is_json_object(text: str) -> Optional[dict]:
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+def parse_input(raw: str) -> dict:
+    obj = _is_json_object(raw)
+    if obj is not None:
+        return obj
+    try:
+        decoded = base64.b64decode(raw, validate=True).decode("utf-8")
+    except Exception:
+        raise ValidationError(
+            "Invalid JSON input: not a JSON object and not valid base64-encoded JSON"
+        )
+    obj = _is_json_object(decoded)
+    if obj is None:
+        raise ValidationError(
+            "Invalid JSON input: base64 decoded successfully but payload is not a JSON object"
+        )
+    return obj
+
+
+def validate(payload: dict) -> dict:
+    for field in REQUIRED_FIELDS:
+        if not payload.get(field):
+            raise ValidationError(f"Missing required field: {field}")
+
+    action = payload["action"]
+    if action not in VALID_ACTIONS:
+        raise ValidationError(
+            f"Invalid action: {action}. Must be one of: "
+            + ", ".join(sorted(VALID_ACTIONS))
+        )
+
+    correlation_id = payload.get("correlation_id") or ""
+    result_table = payload.get("result_table") or ""
+
+    if result_table and not TABLE_NAME_RE.match(result_table):
+        raise ValidationError(f"Invalid result_table name: {result_table}")
+    if correlation_id and not UUID_RE.match(correlation_id):
+        raise ValidationError(f"Invalid correlation_id: {correlation_id}")
+    if correlation_id and not result_table:
+        raise ValidationError("correlation_id provided without result_table")
+    if result_table and not correlation_id:
+        raise ValidationError("result_table provided without correlation_id")
+
+    if action == "bulk_create" and not payload.get("csv_url"):
+        raise ValidationError("bulk_create requires csv_url")
+
+    return payload
+
+
+# --- JDBC parsing ----------------------------------------------------------
+
+def parse_jdbc_url(db_url: str) -> dict:
+    if not db_url.startswith("jdbc:postgresql://"):
+        raise ValidationError(f"Failed to parse JDBC URL for psql connection: {db_url}")
+    parsed = urllib.parse.urlparse(db_url[len("jdbc:"):])
+    host = parsed.hostname or ""
+    dbname = parsed.path.lstrip("/")
+    if not host or not dbname:
+        raise ValidationError(f"Failed to parse JDBC URL for psql connection: {db_url}")
+    try:
+        port = str(parsed.port) if parsed.port is not None else "5432"
+    except ValueError:
+        raise ValidationError(f"Failed to extract valid port from JDBC URL: {db_url}")
+    sslmode = urllib.parse.parse_qs(parsed.query).get("sslmode", ["require"])[0]
+    return {"host": host, "port": port, "dbname": dbname, "sslmode": sslmode}
+
+
+# --- data-sources.xml ------------------------------------------------------
+
+DATA_SOURCES_XML_TMPL = """<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans
+         http://www.springframework.org/schema/beans/spring-beans.xsd">
+  <bean id="dataSource" class="org.springframework.jdbc.datasource.DriverManagerDataSource">
+    <property name="driverClassName" value="org.postgresql.Driver"/>
+    <property name="url" value={url}/>
+    <property name="username" value={user}/>
+    <property name="password" value={pw}/>
+  </bean>
+</beans>
+"""
+
+def write_data_sources_xml(tmpdir: str, db_url: str, db_user: str, db_pass: str) -> str:
+    path = os.path.join(tmpdir, "data-sources.xml")
+    body = DATA_SOURCES_XML_TMPL.format(
+        url=quoteattr(db_url),
+        user=quoteattr(db_user),
+        pw=quoteattr(db_pass),
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    os.chmod(path, 0o600)
+    return path
+
+
+# --- psql client -----------------------------------------------------------
+
+class PgClient:
+    """Shells out to psql so the existing test suite (which mocks psql as a
+    binary on PATH) keeps working. All SQL that interpolates user-controlled
+    data is dollar-quoted with a random tag to prevent body breakout."""
+
+    def __init__(self, host, port, dbname, sslmode, user, password):
+        self.host = host
+        self.port = port
+        self.dbname = dbname
+        self.sslmode = sslmode
+        self.user = user
+        self.password = password
+
+    @classmethod
+    def from_jdbc(cls, db_url: str, user: str, password: str) -> "PgClient":
+        pg = parse_jdbc_url(db_url)
+        return cls(pg["host"], pg["port"], pg["dbname"], pg["sslmode"], user, password)
+
+    @property
+    def _conn_str(self) -> str:
+        return (
+            f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}"
+            f"/{self.dbname}?sslmode={self.sslmode}"
+        )
+
+    def _run(self, *args: str, stdin: Optional[str] = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["psql", self._conn_str, "-q", *args],
+            input=stdin, text=True, capture_output=True, check=False,
+        )
+
+    def ensure_result_table(self, result_table: str) -> bool:
+        ddl = f"""    CREATE TABLE IF NOT EXISTS "{result_table}" (
       id              BIGSERIAL PRIMARY KEY,
       correlation_id  UUID NOT NULL UNIQUE,
       status          VARCHAR(20) NOT NULL DEFAULT 'succeeded',
@@ -26,251 +190,253 @@ ensure_result_table() {
       error_message   TEXT,
       created_at      TIMESTAMP NOT NULL DEFAULT NOW()
     );
-EOSQL
-}
+"""
+        return self._run(stdin=ddl).returncode == 0
 
-write_result() {
-  local status="$1"
-  local result_data="$2"
-  local error_message="$3"
+    def purge_old_rows(self, result_table: str) -> None:
+        self._run(
+            "-c",
+            f'DELETE FROM "{result_table}" WHERE created_at < NOW() - INTERVAL \'24 hours\';',
+        )
 
-  # No-op if result reporting was not requested or connection params are not yet parsed
-  if [ -z "${pg_host:-}" ] || [ -z "${result_table:-}" ]; then
-    return 0
-  fi
+    def write_result(self, result_table: str, correlation_id: str,
+                     status: str, result_data: str, error_message: str) -> bool:
+        rd_sql = "NULL"
+        em = error_message
+        if result_data:
+            try:
+                json.loads(result_data)
+                rd_sql = _dollar_quote(result_data, "dq") + "::jsonb"
+            except ValueError:
+                if not em:
+                    em = f"Non-JSON output: {result_data}"
+        em_sql = _dollar_quote(em, "em") if em else "NULL"
 
-  # Use a per-call randomized dollar-quote tag to prevent breakout from data content
-  local dq_tag
-  dq_tag="dq$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        sql = (
+            f'    INSERT INTO "{result_table}" (correlation_id, status, result_data, error_message)\n'
+            f"    VALUES ('{correlation_id}', '{status}', {rd_sql}, {em_sql})\n"
+            f"    ON CONFLICT (correlation_id) DO UPDATE SET\n"
+            f"      status = EXCLUDED.status,\n"
+            f"      result_data = EXCLUDED.result_data,\n"
+            f"      error_message = EXCLUDED.error_message;\n"
+        )
+        return self._run(stdin=sql).returncode == 0
 
-  local rd_sql="NULL"
-  if [ -n "$result_data" ]; then
-    if echo "$result_data" | jq empty 2>/dev/null; then
-      rd_sql="\$${dq_tag}\$${result_data}\$${dq_tag}\$::jsonb"
-    else
-      # JAR produced non-JSON output; store as error since result_data is JSONB-typed
-      if [ -z "$error_message" ]; then
-        error_message="Non-JSON output: $result_data"
-      fi
-    fi
-  fi
 
-  local em_dq_tag
-  em_dq_tag="em$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+def _dollar_quote(body: str, prefix: str) -> str:
+    tag = prefix + os.urandom(6).hex()
+    return f"${tag}${body}${tag}$"
 
-  local em_sql="NULL"
-  if [ -n "$error_message" ]; then
-    em_sql="\$${em_dq_tag}\$${error_message}\$${em_dq_tag}\$"
-  fi
 
-  run_psql <<EOSQL
-    INSERT INTO "${result_table}" (correlation_id, status, result_data, error_message)
-    VALUES ('${correlation_id}', '${status}', ${rd_sql}, ${em_sql})
-    ON CONFLICT (correlation_id) DO UPDATE SET
-      status = EXCLUDED.status,
-      result_data = EXCLUDED.result_data,
-      error_message = EXCLUDED.error_message;
-EOSQL
-}
+# --- JAR invocation --------------------------------------------------------
 
-error_exit() {
-  local msg="$1"
-  if [ -n "${correlation_id:-}" ] && [ -n "${result_table:-}" ]; then
-    write_result "failed" "" "$msg" 2>&1 || echo "WARNING: Failed to write error result to database" >&2
-  fi
-  jq -n --arg msg "$msg" '{"success":false,"error":$msg}'
-  exit 1
-}
+def _java_opts() -> list:
+    return shlex.split(os.environ.get("JAVA_OPTS", ""))
 
-# --- Parse input ---
+def run_jar(args: list) -> subprocess.CompletedProcess:
+    cmd = [
+        "java", *_java_opts(),
+        "-cp", f"{JAR_PATH}:{PG_DRIVER_PATH}",
+        MAIN_CLASS,
+        *args,
+    ]
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
-if [ $# -lt 1 ]; then
-  error_exit "Usage: entrypoint.sh '<json_blob>' | <base64-encoded-json>"
-fi
 
-# Accept either a base64-encoded JSON object or a raw JSON object for backwards
-# compatibility. Base64 encoding avoids shell tokenization issues when the JSON
-# contains spaces (e.g., in name/details fields), since Render passes startCommand
-# as argv.
-#
-# Require an object (not a bare scalar) so a base64 string that happens to parse
-# as a JSON scalar doesn't mis-route to the raw branch.
-is_json_object() {
-  printf '%s' "$1" | jq -e 'type=="object"' >/dev/null 2>&1
-}
+def download_csv(url: str, dest_path: str) -> None:
+    """Download CSV at `url` to `dest_path` with a hard size cap and timeout.
 
-RAW_INPUT="$1"
+    Never includes `url` in raised error messages — signed URLs may carry
+    credentials.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "api-key-service"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=CSV_TIMEOUT_SECS)
+    except urllib.error.HTTPError as e:
+        raise ValidationError(f"Failed to download CSV: HTTP {e.code}")
+    except (urllib.error.URLError, socket.timeout, OSError):
+        raise ValidationError("Failed to download CSV")
 
-if is_json_object "$RAW_INPUT"; then
-  JSON_INPUT="$RAW_INPUT"
-else
-  if ! decoded=$(printf '%s' "$RAW_INPUT" | base64 -d 2>/dev/null) || [ -z "$decoded" ]; then
-    error_exit "Invalid JSON input: not a JSON object and not valid base64-encoded JSON"
-  fi
-  if ! is_json_object "$decoded"; then
-    error_exit "Invalid JSON input: base64 decoded successfully but payload is not a JSON object"
-  fi
-  JSON_INPUT="$decoded"
-fi
+    with resp:
+        cl = resp.headers.get("Content-Length")
+        if cl and cl.isdigit() and int(cl) > CSV_MAX_BYTES:
+            raise ValidationError(f"CSV exceeds maximum size of {CSV_MAX_BYTES} bytes")
+        total = 0
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > CSV_MAX_BYTES:
+                    raise ValidationError(
+                        f"CSV exceeds maximum size of {CSV_MAX_BYTES} bytes"
+                    )
+                f.write(chunk)
+    os.chmod(dest_path, 0o600)
 
-action=$(echo "$JSON_INPUT" | jq -r '.action // ""')
-db_url=$(echo "$JSON_INPUT" | jq -r '.db_url // ""')
-db_user=$(echo "$JSON_INPUT" | jq -r '.db_user // ""')
-db_pass=$(echo "$JSON_INPUT" | jq -r '.db_pass // ""')
 
-for field in action db_url db_user db_pass; do
-  if [ -z "${!field}" ]; then
-    error_exit "Missing required field: $field"
-  fi
-done
+SINGLE_ACTION_FIELDS = (
+    ("key", "-k"),
+    ("name", "-n"),
+    ("email", "-e"),
+    ("company", "-o"),
+    ("details", "-d"),
+    ("minApiReqInt", "-m"),
+)
 
-case "$action" in
-  create|list|get|update|delete) ;;
-  *) error_exit "Invalid action: $action. Must be one of: create, list, get, update, delete" ;;
-esac
+BULK_ROW_FIELDS = (
+    ("name", "-n"),
+    ("email", "-e"),
+    ("company", "-o"),
+    ("notes", "-d"),
+)
 
-correlation_id=$(echo "$JSON_INPUT" | jq -r '.correlation_id // ""')
-result_table=$(echo "$JSON_INPUT" | jq -r '.result_table // ""')
 
-if [ -n "$result_table" ] && ! echo "$result_table" | grep -qE '^[a-z_][a-z0-9_]*$'; then
-  error_exit "Invalid result_table name: $result_table"
-fi
+def build_args(action: str, source: dict, fields, ds_xml_path: str,
+               initial: tuple = ()) -> list:
+    args = [action, *initial]
+    for field, flag in fields:
+        val = (source.get(field) or "").strip()
+        if val:
+            args += [flag, val]
+    args += ["-c", ds_xml_path, "-j"]
+    return args
 
-if [ -n "$correlation_id" ] && ! echo "$correlation_id" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-  error_exit "Invalid correlation_id: $correlation_id"
-fi
 
-# Require both fields together — providing one without the other is a caller bug
-if [ -n "$correlation_id" ] && [ -z "$result_table" ]; then
-  error_exit "correlation_id provided without result_table"
-fi
-if [ -n "$result_table" ] && [ -z "$correlation_id" ]; then
-  error_exit "result_table provided without correlation_id"
-fi
+def run_bulk_create(csv_path: str, ds_xml_path: str) -> dict:
+    total = succeeded = failed = 0
+    errors: list = []
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        for row_num, row in enumerate(csv.DictReader(f), start=1):
+            total += 1
+            api_key = (row.get("api_key") or "").strip()
+            if not api_key:
+                failed += 1
+                errors.append({"row": row_num, "error": "missing api_key"})
+                continue
+            args = build_args("create", row, BULK_ROW_FIELDS, ds_xml_path,
+                              initial=("-k", api_key))
+            proc = run_jar(args)
+            if proc.returncode == 0:
+                succeeded += 1
+            else:
+                failed += 1
+                err_text = (proc.stderr or "").strip()[:500] or (
+                    f"JAR exited with code {proc.returncode}"
+                )
+                errors.append({"row": row_num, "key": api_key, "error": err_text})
+    return {"total": total, "succeeded": succeeded, "failed": failed, "errors": errors}
 
-key=$(echo "$JSON_INPUT" | jq -r '.key // ""')
-name=$(echo "$JSON_INPUT" | jq -r '.name // ""')
-email=$(echo "$JSON_INPUT" | jq -r '.email // ""')
-company=$(echo "$JSON_INPUT" | jq -r '.company // ""')
-details=$(echo "$JSON_INPUT" | jq -r '.details // ""')
-minApiReqInt=$(echo "$JSON_INPUT" | jq -r '.minApiReqInt // ""')
 
-# --- Parse JDBC URL for psql connection ---
+def _emit_error_json(msg: str) -> None:
+    print(json.dumps({"success": False, "error": msg}))
 
-if [ -n "$correlation_id" ] && [ -n "$result_table" ]; then
-  if echo "$db_url" | grep -qE 'jdbc:postgresql://[^:/]+/'; then
-    # No port specified — use default
-    pg_host=$(echo "$db_url" | sed -E 's|jdbc:postgresql://([^/]+)/.*|\1|')
-    pg_port="5432"
-  else
-    pg_host=$(echo "$db_url" | sed -E 's|jdbc:postgresql://([^:]+):.*|\1|')
-    pg_port=$(echo "$db_url" | sed -E 's|jdbc:postgresql://[^:]+:([0-9]+)/.*|\1|')
-  fi
-  pg_dbname=$(echo "$db_url" | sed -E 's|jdbc:postgresql://[^/]+/([^?]+).*|\1|')
-  pg_sslmode=$(echo "$db_url" | sed -nE 's|.*[?&]sslmode=([^&]+).*|\1|p')
 
-  if [ -z "$pg_host" ] || [ -z "$pg_port" ] || [ -z "$pg_dbname" ]; then
-    error_exit "Failed to parse JDBC URL for psql connection: $db_url"
-  fi
-  if ! echo "$pg_port" | grep -qE '^[0-9]+$'; then
-    error_exit "Failed to extract valid port from JDBC URL: $db_url"
-  fi
-fi
+_JSON_LINE_START = re.compile(r"^\s*[\[{]")
 
-# --- Build data-sources.xml ---
+def extract_jar_json(output: str) -> str:
+    lines = output.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if _JSON_LINE_START.match(line):
+            return "".join(lines[i:])
+    return output
 
-xml_escape() {
-  local s="$1"
-  s="${s//&/&amp;}"
-  s="${s//</&lt;}"
-  s="${s//>/&gt;}"
-  s="${s//\"/&quot;}"
-  s="${s//\'/&apos;}"
-  echo "$s"
-}
 
-SECURE_TMPDIR=$(mktemp -d)
-chmod 700 "$SECURE_TMPDIR"
+def _record_result(pg: Optional[PgClient], result_table: str, correlation_id: str,
+                   status: str, result_data: str, error_message: str) -> None:
+    if pg is None or not result_table or not correlation_id:
+        return
+    if not pg.ensure_result_table(result_table):
+        print(
+            f"ERROR: Failed to create/verify result table '{result_table}'. "
+            "Result will not be written.",
+            file=sys.stderr,
+        )
+        return
+    pg.purge_old_rows(result_table)
+    if not pg.write_result(result_table, correlation_id, status, result_data, error_message):
+        print(
+            f"ERROR: Failed to write result to {result_table} "
+            f"for correlation_id={correlation_id}",
+            file=sys.stderr,
+        )
 
-escaped_url=$(xml_escape "$db_url")
-escaped_user=$(xml_escape "$db_user")
-escaped_pass=$(xml_escape "$db_pass")
 
-cat > "$SECURE_TMPDIR/data-sources.xml" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<beans xmlns="http://www.springframework.org/schema/beans"
-       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-       xsi:schemaLocation="http://www.springframework.org/schema/beans
-         http://www.springframework.org/schema/beans/spring-beans.xsd">
-  <bean id="dataSource" class="org.springframework.jdbc.datasource.DriverManagerDataSource">
-    <property name="driverClassName" value="org.postgresql.Driver"/>
-    <property name="url" value="${escaped_url}"/>
-    <property name="username" value="${escaped_user}"/>
-    <property name="password" value="${escaped_pass}"/>
-  </bean>
-</beans>
-EOF
-chmod 600 "$SECURE_TMPDIR/data-sources.xml"
+def main(argv: list) -> int:
+    if len(argv) < 2:
+        _emit_error_json("Usage: entrypoint.sh '<json_blob>' | <base64-encoded-json>")
+        return 1
 
-# --- Build JAR arguments ---
+    tmpdir = None
+    pg: Optional[PgClient] = None
+    correlation_id = ""
+    result_table = ""
+    try:
+        payload = parse_input(argv[1])
+        validate(payload)
 
-ARGS=("$action")
+        correlation_id = payload.get("correlation_id") or ""
+        result_table = payload.get("result_table") or ""
+        db_url = payload["db_url"]
+        db_user = payload["db_user"]
+        db_pass = payload["db_pass"]
 
-[ -n "$key" ] && ARGS+=(-k "$key")
-[ -n "$name" ] && ARGS+=(-n "$name")
-[ -n "$email" ] && ARGS+=(-e "$email")
-[ -n "$company" ] && ARGS+=(-o "$company")
-[ -n "$details" ] && ARGS+=(-d "$details")
-[ -n "$minApiReqInt" ] && ARGS+=(-m "$minApiReqInt")
+        if correlation_id and result_table:
+            pg = PgClient.from_jdbc(db_url, db_user, db_pass)
 
-ARGS+=(-c "$SECURE_TMPDIR/data-sources.xml" -j)
+        tmpdir = tempfile.mkdtemp()
+        os.chmod(tmpdir, 0o700)
+        ds_xml = write_data_sources_xml(tmpdir, db_url, db_user, db_pass)
 
-# --- Run JAR and capture output ---
-# Do not use exec — the EXIT trap must fire to clean up data-sources.xml
+        if payload["action"] == "bulk_create":
+            csv_path = os.path.join(tmpdir, "import.csv")
+            download_csv(payload["csv_url"], csv_path)
+            summary = run_bulk_create(csv_path, ds_xml)
+            jar_output = json.dumps(summary) + "\n"
+            jar_stderr = ""
+            jar_exit_code = 0
+        else:
+            args = build_args(payload["action"], payload, SINGLE_ACTION_FIELDS, ds_xml)
+            proc = run_jar(args)
+            jar_output = proc.stdout
+            jar_stderr = proc.stderr
+            jar_exit_code = proc.returncode
 
-# shellcheck disable=SC2206
-JAVA_OPTS_ARRAY=(${JAVA_OPTS:-})
+        if jar_exit_code == 0:
+            _record_result(
+                pg, result_table, correlation_id,
+                "succeeded", extract_jar_json(jar_output), "",
+            )
+        else:
+            _record_result(
+                pg, result_table, correlation_id,
+                "failed", "", f"JAR exited with code {jar_exit_code}: {jar_stderr}",
+            )
 
-jar_stderr_file=$(mktemp)
-jar_exit_code=0
-jar_output=$(java ${JAVA_OPTS_ARRAY[@]+"${JAVA_OPTS_ARRAY[@]}"} \
-  -cp "/app/api-key-cli.jar:/app/postgresql.jar" \
-  org.onebusaway.cli.apikey.ApiKeyCliMain \
-  "${ARGS[@]}" 2>"$jar_stderr_file") || jar_exit_code=$?
-jar_stderr=$(cat "$jar_stderr_file")
-rm -f "$jar_stderr_file"
+        if jar_output:
+            sys.stdout.write(jar_output)
+            if not jar_output.endswith("\n"):
+                sys.stdout.write("\n")
+        if jar_stderr:
+            sys.stderr.write(jar_stderr)
+            if not jar_stderr.endswith("\n"):
+                sys.stderr.write("\n")
+        return jar_exit_code
 
-# --- Write result to table if correlation_id is set ---
-# Reporting failures must not kill the script after the JAR has already run
+    except ValidationError as e:
+        msg = str(e)
+        if pg is not None:
+            try:
+                pg.write_result(result_table, correlation_id, "failed", "", msg)
+            except Exception:
+                print("WARNING: Failed to write error result to database", file=sys.stderr)
+        _emit_error_json(msg)
+        return 1
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
-if [ -n "$correlation_id" ] && [ -n "$result_table" ]; then
-  if ! ensure_result_table; then
-    echo "ERROR: Failed to create/verify result table '${result_table}'. Result will not be written." >&2
-  else
-    # Purge result rows older than 24 hours to prevent unbounded table growth
-    run_psql -c "DELETE FROM \"${result_table}\" WHERE created_at < NOW() - INTERVAL '24 hours';" 2>&1 || echo "WARNING: Orphan row cleanup failed" >&2
 
-    if [ "$jar_exit_code" -eq 0 ]; then
-      # The JAR may print non-JSON warning lines to stdout before the JSON payload.
-      # Extract just the JSON object/array for storage.
-      jar_json=$(echo "$jar_output" | sed -n '/^[[:space:]]*[{\[]/,$p')
-      if [ -z "$jar_json" ]; then
-        jar_json="$jar_output"
-      fi
-      if ! write_result "succeeded" "$jar_json" ""; then
-        echo "ERROR: Failed to write result to ${result_table} for correlation_id=${correlation_id}" >&2
-      fi
-    else
-      if ! write_result "failed" "" "JAR exited with code $jar_exit_code: $jar_stderr"; then
-        echo "ERROR: Failed to write result to ${result_table} for correlation_id=${correlation_id}" >&2
-      fi
-    fi
-  fi
-fi
-
-# Always echo to stdout/stderr for Render dashboard visibility (duplicates DB result intentionally)
-echo "$jar_output"
-if [ -n "$jar_stderr" ]; then
-  echo "$jar_stderr" >&2
-fi
-exit "$jar_exit_code"
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

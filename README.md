@@ -20,7 +20,10 @@ docker build --build-arg JAR_VERSION=2.7.1 -t api-key-service .
 
 ## Usage
 
-The entrypoint accepts a single JSON argument containing the action, database credentials, and any command-specific fields.
+The entrypoint accepts a single argument containing the action, database credentials, and any command-specific fields. The argument can be either:
+
+- **Base64-encoded JSON** (preferred, especially for Render) — avoids shell tokenization issues when fields contain spaces
+- **Raw JSON** — supported for backwards compatibility
 
 ### JSON Input
 
@@ -130,6 +133,19 @@ curl -X POST "https://api.render.com/v1/services/srv-YOUR_SERVICE_ID/jobs" \
   -d '{
     "startCommand": "/app/entrypoint.sh '\''{ \"action\": \"list\", \"db_url\": \"jdbc:postgresql://dpg-abc123:5432/mydb\", \"db_user\": \"myuser\", \"db_pass\": \"mypass\" }'\''"
   }'
+```
+
+**Recommended: base64-encode the JSON** to avoid shell tokenization issues when
+any field contains spaces (e.g. a contact name like `Jane Doe`). Render splits
+`startCommand` on whitespace, so raw JSON breaks whenever a value has a space:
+
+```bash
+JSON='{"action":"create","db_url":"jdbc:postgresql://dpg-abc123:5432/mydb","db_user":"myuser","db_pass":"mypass","name":"Jane Doe"}'
+B64=$(printf '%s' "$JSON" | base64)
+curl -X POST "https://api.render.com/v1/services/srv-YOUR_SERVICE_ID/jobs" \
+  -H "Authorization: Bearer rnd_YOUR_RENDER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"startCommand\":\"/app/entrypoint.sh $B64\"}"
 ```
 
 You can check the job's output in the Render dashboard under your worker's **Logs** tab, or poll the job status via the API.

@@ -38,7 +38,14 @@ docker compose -f docker-compose.test.yml down -v
 
 ## Render deployment
 
-Triggered via the Render one-off job API. The `startCommand` is:
+Triggered via the Render one-off job API. The `startCommand` should pass a
+base64-encoded JSON blob to avoid argv tokenization issues when fields contain
+spaces (Render splits `startCommand` on whitespace):
+```
+/app/entrypoint.sh <base64-encoded-json>
+```
+
+Raw JSON is still accepted for backwards compatibility:
 ```
 /app/entrypoint.sh '<json_blob>'
 ```

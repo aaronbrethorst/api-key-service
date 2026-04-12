@@ -1,5 +1,6 @@
 """Tests for entrypoint.sh input validation logic."""
 
+import base64
 import json
 
 from conftest import run_entrypoint
@@ -221,3 +222,65 @@ class TestPairValidation:
             bin_dir=bin_dir,
         )
         assert rc == 0
+
+
+def _b64(payload):
+    """Base64-encode a string for use as the entrypoint argument."""
+    return base64.b64encode(payload.encode()).decode()
+
+
+class TestBase64Input:
+    """The entrypoint accepts base64-encoded JSON to avoid argv tokenization
+    issues on Render when JSON fields contain spaces."""
+
+    def test_base64_happy_path(self, mock_bin):
+        """Base64-encoded valid JSON should be decoded and pass through."""
+        bin_dir, _ = mock_bin
+        payload = json.dumps({
+            "action": "list",
+            "db_url": "jdbc:postgresql://h:5432/d",
+            "db_user": "u", "db_pass": "p",
+        })
+        _, _, rc = run_entrypoint(_b64(payload), bin_dir=bin_dir)
+        assert rc == 0
+
+    def test_base64_with_spaces_in_fields(self, mock_bin):
+        """The motivating case: JSON with spaces in name/details fields."""
+        bin_dir, _ = mock_bin
+        payload = json.dumps({
+            "action": "create",
+            "db_url": "jdbc:postgresql://h:5432/d",
+            "db_user": "u", "db_pass": "p",
+            "name": "Jane Doe",
+            "details": "Some multi word details",
+        })
+        _, _, rc = run_entrypoint(_b64(payload), bin_dir=bin_dir)
+        assert rc == 0
+
+    def test_invalid_base64_gibberish(self):
+        """Garbage that is neither JSON nor base64 should fail cleanly."""
+        stdout, _, rc = run_entrypoint("!!!not-base64!!!")
+        out = _error(stdout)
+        assert rc == 1
+        assert "Invalid JSON input" in out["error"]
+
+    def test_base64_of_non_json(self):
+        """Valid base64 that decodes to non-JSON should report the specific failure."""
+        stdout, _, rc = run_entrypoint(_b64("hello world"))
+        out = _error(stdout)
+        assert rc == 1
+        assert "Invalid JSON input" in out["error"]
+
+    def test_base64_of_json_scalar_rejected(self):
+        """Base64 of a bare JSON scalar (not an object) should be rejected."""
+        stdout, _, rc = run_entrypoint(_b64('"just a string"'))
+        out = _error(stdout)
+        assert rc == 1
+        assert "Invalid JSON input" in out["error"]
+
+    def test_raw_json_scalar_rejected(self):
+        """Raw JSON that is a bare scalar (not an object) should be rejected."""
+        stdout, _, rc = run_entrypoint('"just a string"')
+        out = _error(stdout)
+        assert rc == 1
+        assert "Invalid JSON input" in out["error"]

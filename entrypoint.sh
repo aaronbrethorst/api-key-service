@@ -85,13 +85,28 @@ error_exit() {
 # --- Parse input ---
 
 if [ $# -lt 1 ]; then
-  error_exit "Usage: entrypoint.sh '<json_blob>'"
+  error_exit "Usage: entrypoint.sh '<json_blob>' | <base64-encoded-json>"
 fi
 
-JSON_INPUT="$1"
+# Accept either a base64-encoded JSON object or a raw JSON object for backwards
+# compatibility. Base64 encoding avoids shell tokenization issues when the JSON
+# contains spaces (e.g., in name/details fields), since Render passes startCommand
+# as argv.
+#
+# Require an object (not a bare scalar) so a base64 string that happens to parse
+# as a JSON scalar doesn't mis-route to the raw branch.
+RAW_INPUT="$1"
 
-if ! echo "$JSON_INPUT" | jq empty 2>/dev/null; then
-  error_exit "Invalid JSON input"
+if printf '%s' "$RAW_INPUT" | jq -e 'type=="object"' >/dev/null 2>&1; then
+  JSON_INPUT="$RAW_INPUT"
+else
+  if ! decoded=$(printf '%s' "$RAW_INPUT" | base64 -d 2>/dev/null) || [ -z "$decoded" ]; then
+    error_exit "Invalid JSON input: not a JSON object and not valid base64-encoded JSON"
+  fi
+  if ! printf '%s' "$decoded" | jq -e 'type=="object"' >/dev/null 2>&1; then
+    error_exit "Invalid JSON input: base64 decoded successfully but payload is not a JSON object"
+  fi
+  JSON_INPUT="$decoded"
 fi
 
 action=$(echo "$JSON_INPUT" | jq -r '.action // ""')

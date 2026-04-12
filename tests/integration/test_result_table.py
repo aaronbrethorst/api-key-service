@@ -1,5 +1,6 @@
 """Integration tests for correlation_id / result_table flow against real PostgreSQL."""
 
+import json
 import uuid
 
 from .helpers import assert_success, make_input, run_service
@@ -78,6 +79,43 @@ class TestResultTableWriting:
         )
         count = cur.fetchone()[0]
         assert count == 1, f"Expected 1 row, found {count}"
+
+    def test_validation_error_recorded_when_table_not_yet_created(self, db_conn):
+        """Issue #7: a ValidationError on first run (fresh table) must still
+        record a 'failed' row rather than silently losing the correlation."""
+        table_name = "test_validation_err"
+        corr_id = str(uuid.uuid4())
+
+        cur = db_conn.cursor()
+        try:
+            cur.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+
+            # bulk_create with no csv_url → ValidationError
+            stdout, stderr, rc = run_service({
+                "action": "bulk_create",
+                "db_url": "jdbc:postgresql://postgres:5432/oba_test?sslmode=disable",
+                "db_user": "testuser",
+                "db_pass": "testpass",
+                "correlation_id": corr_id,
+                "result_table": table_name,
+            })
+            assert rc == 1, f"stdout={stdout} stderr={stderr}"
+            err = json.loads(stdout.strip().splitlines()[-1])
+            assert "csv_url" in err["error"]
+
+            cur.execute(
+                f'SELECT status, error_message FROM "{table_name}" '
+                f'WHERE correlation_id = %s',
+                (corr_id,),
+            )
+            row = cur.fetchone()
+            assert row is not None, \
+                "ValidationError must write a failed row even when table is fresh"
+            status, error_message = row
+            assert status == "failed"
+            assert "csv_url" in error_message
+        finally:
+            cur.execute(f'DROP TABLE IF EXISTS "{table_name}"')
 
     def test_old_rows_cleaned_up(self, db_conn):
         """Rows older than 24 hours should be deleted on the next run."""

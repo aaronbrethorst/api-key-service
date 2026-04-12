@@ -95,15 +95,19 @@ fi
 #
 # Require an object (not a bare scalar) so a base64 string that happens to parse
 # as a JSON scalar doesn't mis-route to the raw branch.
+is_json_object() {
+  printf '%s' "$1" | jq -e 'type=="object"' >/dev/null 2>&1
+}
+
 RAW_INPUT="$1"
 
-if printf '%s' "$RAW_INPUT" | jq -e 'type=="object"' >/dev/null 2>&1; then
+if is_json_object "$RAW_INPUT"; then
   JSON_INPUT="$RAW_INPUT"
 else
   if ! decoded=$(printf '%s' "$RAW_INPUT" | base64 -d 2>/dev/null) || [ -z "$decoded" ]; then
     error_exit "Invalid JSON input: not a JSON object and not valid base64-encoded JSON"
   fi
-  if ! printf '%s' "$decoded" | jq -e 'type=="object"' >/dev/null 2>&1; then
+  if ! is_json_object "$decoded"; then
     error_exit "Invalid JSON input: base64 decoded successfully but payload is not a JSON object"
   fi
   JSON_INPUT="$decoded"
